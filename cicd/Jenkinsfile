@@ -1,0 +1,86 @@
+#!groovy
+@Library('slack-notifier-lib') _ 
+
+// docker
+def dockerRegistryUrl = 'http://my.registry.com'
+def dockerRegistryCred = 'registry-creds'
+
+podTemplate(yaml: '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:latest
+    imagePullPolicy: Always
+    command:
+    - cat
+    tty: true
+    env:
+      - name: POD_IP
+        valueFrom:
+            fieldRef:
+               fieldPath: status.podIP
+      - name: DOCKER_HOST
+        value: tcp://localhost:2375
+  - name: dind
+    image: docker:19.03.5-dind
+    env:
+      - name: DOCKER_TLS_CERTDIR
+        value: ""
+    args: ["--insecure-registry", "my.registry.com"]
+    securityContext:
+       privileged: true
+    volumeMounts:
+    - name: dind-storage
+      mountPath: /var/lib/docker
+  volumes:
+  - name: dind-storage
+    emptyDir: {}
+''') {
+    node (POD_LABEL) {
+        stage ('Get repo') {
+            container('docker') {
+                scmVars = checkout scm
+            }
+        }
+        stage ('Build  images') {
+            def gitBranch = "${scmVars.GIT_BRANCH}".split('/')[1]
+            def gitCommit = "${scmVars.GIT_COMMIT}".substring(0,8)
+            withEnv(["gitBranch=${scmVars.GIT_BRANCH}.split('/')[1]",
+             "gitCommit=${scmVars.GIT_COMMIT}.substring(0,8)"
+            ]) {
+            parallel (
+                'ovftool': {
+                    stage ('Build ovftool') {
+                        container('docker') {
+                            docker.withRegistry(dockerRegistryUrl, dockerRegistryCred) {
+                                def customImage = docker.build("ovftool:${gitBranch}-${gitCommit}", "./ovftool")
+                                customImage.push()
+                                customImage.push('latest')
+
+                            }
+                        }
+                    }
+                },
+                'packer-govc': {
+                    stage ('Build packer-govc') {
+                        container('docker') {
+                            docker.withRegistry(dockerRegistryUrl, dockerRegistryCred) {
+                                def customImage = docker.build("packer-govc:${gitBranch}-${gitCommit}", "./packer-govc")
+                                customImage.push()
+                                customImage.push('latest')
+                            }
+                        }
+                    }
+                }
+            )
+            }
+        }
+        stage ('Notify Slack') {
+            container('jnlp') {
+                notifySlack currentBuild.result
+            }
+        }
+    }
+}
